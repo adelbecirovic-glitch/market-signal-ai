@@ -17,6 +17,10 @@ ASSETS = {
     "Bitcoin": "BTC-USD",
     "Ethereum": "ETH-USD",
     "Solana": "SOL-USD",
+    "XRP": "XRP-USD",
+    "Chainlink": "LINK-USD",
+    "Hyperliquid (HYPE)": "HYPE32196-USD",
+    "Sui": "SUI20947-USD",
 }
 
 def ema(s, n):
