@@ -181,7 +181,130 @@ def analyze(ticker):
         "alignment": alignment, "reasons": reasons, "frames": frames
     }
 
-st.title("Market Signal AI · V3")
+
+def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
+    """
+    Conservative daily backtest of the same technical score family.
+    Long entry: score >= 65; short entry: score < 40.
+    Exit: score returns to neutral/opposite OR ATR stop/target is hit.
+    Uses next bar open for signal entries to reduce look-ahead bias.
+    """
+    raw = yf.download(ticker, period="10y", interval="1d", auto_adjust=True, progress=False)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    raw = raw.dropna()
+    if len(raw) < 260:
+        return None
+
+    df = enrich(raw)
+    scores = []
+    for i in range(len(df)):
+        sub = df.iloc[:i+1]
+        scores.append(timeframe_score(sub) if len(sub) >= 30 else None)
+    df["Score"] = scores
+    df = df.dropna(subset=["Score"]).copy()
+
+    equity = initial_capital
+    peak = equity
+    max_dd = 0.0
+    trades = []
+    position = None
+
+    for i in range(len(df)-1):
+        row = df.iloc[i]
+        nxt = df.iloc[i+1]
+        score = int(row["Score"])
+
+        if position is None:
+            direction = 1 if score >= 65 else (-1 if score < 40 else 0)
+            if direction == 0:
+                continue
+
+            entry = float(nxt["Open"])
+            a = float(row["ATR"])
+            if not np.isfinite(a) or a <= 0:
+                continue
+
+            stop_dist = 1.5 * a
+            target_dist = 2.5 * a
+            stop = entry - direction * stop_dist
+            target = entry + direction * target_dist
+
+            risk_cash = equity * risk_pct
+            qty = risk_cash / stop_dist if stop_dist > 0 else 0
+            if qty <= 0:
+                continue
+
+            position = {
+                "direction": direction, "entry": entry, "stop": stop,
+                "target": target, "qty": qty, "entry_date": df.index[i+1],
+                "entry_score": score
+            }
+            continue
+
+        direction = position["direction"]
+        exit_price = None
+        reason = None
+
+        # Intraday stop/target test. If both occur in same candle, assume stop first
+        # to keep the backtest conservative.
+        if direction == 1:
+            if float(row["Low"]) <= position["stop"]:
+                exit_price, reason = position["stop"], "Stop"
+            elif float(row["High"]) >= position["target"]:
+                exit_price, reason = position["target"], "Target"
+            elif score < 50:
+                exit_price, reason = float(nxt["Open"]), "Signal"
+        else:
+            if float(row["High"]) >= position["stop"]:
+                exit_price, reason = position["stop"], "Stop"
+            elif float(row["Low"]) <= position["target"]:
+                exit_price, reason = position["target"], "Target"
+            elif score >= 50:
+                exit_price, reason = float(nxt["Open"]), "Signal"
+
+        if exit_price is not None:
+            pnl = (exit_price - position["entry"]) * position["qty"] * direction
+            equity += pnl
+            peak = max(peak, equity)
+            dd = (peak - equity) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+
+            trades.append({
+                "Entry": position["entry_date"].date(),
+                "Exit": df.index[i+1].date(),
+                "Richtung": "LONG" if direction == 1 else "SHORT",
+                "Entry-Preis": position["entry"],
+                "Exit-Preis": exit_price,
+                "PnL": pnl,
+                "Return auf Startkapital %": pnl / initial_capital * 100,
+                "Exit-Grund": reason
+            })
+            position = None
+
+    if not trades:
+        return None
+
+    t = pd.DataFrame(trades)
+    wins = t[t["PnL"] > 0]
+    losses = t[t["PnL"] < 0]
+    gross_profit = wins["PnL"].sum()
+    gross_loss = abs(losses["PnL"].sum())
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+    return {
+        "trades": t,
+        "count": len(t),
+        "win_rate": len(wins) / len(t) * 100,
+        "net_profit": equity - initial_capital,
+        "return_pct": (equity / initial_capital - 1) * 100,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_dd * 100,
+        "ending_equity": equity,
+    }
+
+
+st.title("Market Signal AI · V4")
 st.caption("Multi-Timeframe Scanner: 1H + 4H + Daily")
 
 with st.sidebar:
@@ -269,3 +392,53 @@ st.info(
     "keine Garantie für zukünftige Kursbewegungen. Vor Echtgeld-Einsatz: Backtest, Gebühren, "
     "Slippage und Paper Trading berücksichtigen."
 )
+
+
+st.divider()
+st.header("Historischer Backtest")
+st.caption(
+    "Tagesdaten, bis zu 10 Jahre. Einstieg am nächsten Tages-Open nach dem Signal. "
+    "Modell: 1 % Kontorisiko je Trade, ATR-Stop 1,5×, Target 2,5×."
+)
+
+bt_market = st.selectbox("Backtest-Markt", list(ASSETS.keys()), key="bt_market")
+run_bt = st.button("Backtest starten", type="primary")
+
+if run_bt:
+    with st.spinner(f"Backtest für {bt_market} läuft ..."):
+        try:
+            bt = backtest_daily(ASSETS[bt_market])
+        except Exception as e:
+            bt = None
+            st.error(f"Backtest konnte nicht geladen werden: {e}")
+
+    if bt is None:
+        st.warning("Für diesen Markt stehen aktuell nicht genügend Daten oder Trades zur Verfügung.")
+    else:
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Trades", bt["count"])
+        c2.metric("Trefferquote", f'{bt["win_rate"]:.1f}%')
+        c3.metric("Gesamtrendite", f'{bt["return_pct"]:.1f}%')
+        pf = bt["profit_factor"]
+        c4.metric("Profit Factor", "∞" if not np.isfinite(pf) else f"{pf:.2f}")
+        c5.metric("Max. Drawdown", f'{bt["max_drawdown"]:.1f}%')
+
+        st.markdown("### Letzte Trades")
+        shown = bt["trades"].tail(30).copy()
+        st.dataframe(
+            shown.sort_values("Exit", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Entry-Preis": st.column_config.NumberColumn(format="%.4f"),
+                "Exit-Preis": st.column_config.NumberColumn(format="%.4f"),
+                "PnL": st.column_config.NumberColumn(format="%.2f"),
+                "Return auf Startkapital %": st.column_config.NumberColumn(format="%.2f%%"),
+            }
+        )
+
+        st.warning(
+            "Backtests sind hypothetisch. Dieses Modell berücksichtigt keine Gebühren, "
+            "Slippage, Finanzierungskosten, Steuern oder reale Ausführungsprobleme. "
+            "Historische Ergebnisse garantieren keine zukünftige Performance."
+        )
