@@ -1,10 +1,9 @@
-import math
 import pandas as pd
 import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Market Signal AI", layout="wide")
+st.set_page_config(page_title="Market Signal AI V3", layout="wide")
 
 ASSETS = {
     "S&P 500": "^GSPC",
@@ -31,14 +30,14 @@ def rsi(s, n=14):
     up = d.clip(lower=0)
     dn = -d.clip(upper=0)
     rs = up.ewm(alpha=1/n, adjust=False).mean() / dn.ewm(alpha=1/n, adjust=False).mean()
-    return 100 - (100 / (1 + rs))
+    return 100 - 100/(1+rs)
 
 def atr(df, n=14):
     prev = df["Close"].shift(1)
     tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev).abs(),
-        (df["Low"] - prev).abs()
+        df["High"]-df["Low"],
+        (df["High"]-prev).abs(),
+        (df["Low"]-prev).abs()
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
@@ -47,181 +46,226 @@ def enrich(df):
     df["EMA20"] = ema(df["Close"], 20)
     df["EMA50"] = ema(df["Close"], 50)
     df["EMA200"] = ema(df["Close"], 200)
-    df["RSI"] = rsi(df["Close"], 14)
+    df["RSI"] = rsi(df["Close"])
     df["MACD"] = ema(df["Close"], 12) - ema(df["Close"], 26)
     df["MACD_SIGNAL"] = ema(df["MACD"], 9)
-    df["ATR"] = atr(df, 14)
-    df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+    df["ATR"] = atr(df)
     df["HH20"] = df["High"].rolling(20).max().shift(1)
     df["LL20"] = df["Low"].rolling(20).min().shift(1)
-    return df
+    return df.dropna()
 
-def score_signal(df):
+def timeframe_score(df):
+    if df is None or len(df) < 30:
+        return None
     x = df.iloc[-1]
-    long_score = 50
+    score = 50
 
-    # Trend
-    if x["EMA20"] > x["EMA50"]:
-        long_score += 10
-    else:
-        long_score -= 10
+    score += 10 if x["EMA20"] > x["EMA50"] else -10
+    score += 10 if x["EMA50"] > x["EMA200"] else -10
+    score += 10 if x["Close"] > x["EMA200"] else -10
 
-    if x["EMA50"] > x["EMA200"]:
-        long_score += 10
-    else:
-        long_score -= 10
-
-    if x["Close"] > x["EMA200"]:
-        long_score += 10
-    else:
-        long_score -= 10
-
-    # Momentum
     if 52 <= x["RSI"] <= 70:
-        long_score += 10
-    elif x["RSI"] < 45:
-        long_score -= 10
+        score += 10
+    elif 30 <= x["RSI"] < 45:
+        score -= 10
+    elif x["RSI"] > 75:
+        score -= 5
+    elif x["RSI"] < 25:
+        score += 5
 
-    if x["MACD"] > x["MACD_SIGNAL"]:
-        long_score += 10
-    else:
-        long_score -= 10
+    score += 10 if x["MACD"] > x["MACD_SIGNAL"] else -10
 
-    # Breakout
-    if pd.notna(x["HH20"]) and x["Close"] > x["HH20"]:
-        long_score += 10
-    if pd.notna(x["LL20"]) and x["Close"] < x["LL20"]:
-        long_score -= 10
+    if x["Close"] > x["HH20"]:
+        score += 10
+    elif x["Close"] < x["LL20"]:
+        score -= 10
 
-    # Volume confirmation
-    if pd.notna(x["VOL_MA20"]) and x["Volume"] > x["VOL_MA20"]:
-        long_score += 5 if long_score >= 50 else -5
+    return max(0, min(100, int(score)))
 
-    long_score = int(max(0, min(100, long_score)))
+@st.cache_data(ttl=300)
+def download_raw(ticker):
+    # 1h: enough history to create 4h candles. Daily downloaded separately.
+    h1 = yf.download(ticker, period="2y", interval="1h", auto_adjust=True, progress=False)
+    d1 = yf.download(ticker, period="2y", interval="1d", auto_adjust=True, progress=False)
 
-    if long_score >= 80:
+    for df in (h1, d1):
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+    return h1.dropna(), d1.dropna()
+
+def make_4h(h1):
+    if h1.empty:
+        return h1
+    # Resample actual hourly bars into four-hour OHLCV bars.
+    return h1.resample("4h").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+def analyze(ticker):
+    h1, d1 = download_raw(ticker)
+    h4 = make_4h(h1)
+
+    frames = {}
+    for label, df in [("1H", h1), ("4H", h4), ("Daily", d1)]:
+        if len(df) >= 210:
+            frames[label] = enrich(df)
+        else:
+            frames[label] = None
+
+    scores = {k: timeframe_score(v) for k, v in frames.items()}
+    valid = {k:v for k,v in scores.items() if v is not None}
+    if not valid:
+        return None
+
+    weights = {"1H": 0.20, "4H": 0.35, "Daily": 0.45}
+    denom = sum(weights[k] for k in valid)
+    combined = round(sum(valid[k] * weights[k] for k in valid) / denom)
+
+    if combined >= 80:
         signal = "STRONG LONG"
-    elif long_score >= 65:
+    elif combined >= 65:
         signal = "LONG"
-    elif long_score >= 40:
+    elif combined >= 40:
         signal = "NEUTRAL"
-    elif long_score >= 25:
+    elif combined >= 25:
         signal = "SHORT"
     else:
         signal = "STRONG SHORT"
 
-    px = float(x["Close"])
-    a = float(x["ATR"]) if pd.notna(x["ATR"]) else px * 0.02
+    base = frames["4H"] if frames["4H"] is not None else (frames["Daily"] if frames["Daily"] is not None else frames["1H"])
+    x = base.iloc[-1]
+    price = float(x["Close"])
+    a = float(x["ATR"])
 
-    if long_score >= 50:
-        stop = px - 1.5 * a
-        target1 = px + 2.0 * a
-        target2 = px + 3.0 * a
+    # Entry zone around current price; ATR-based risk levels.
+    if combined >= 50:
+        entry_low, entry_high = price - 0.20*a, price + 0.10*a
+        stop = price - 1.50*a
+        t1, t2, t3 = price + 1.50*a, price + 2.50*a, price + 4.00*a
+        risk = price - stop
+        rr = (t2-price)/risk if risk > 0 else np.nan
     else:
-        stop = px + 1.5 * a
-        target1 = px - 2.0 * a
-        target2 = px - 3.0 * a
+        entry_low, entry_high = price - 0.10*a, price + 0.20*a
+        stop = price + 1.50*a
+        t1, t2, t3 = price - 1.50*a, price - 2.50*a, price - 4.00*a
+        risk = stop-price
+        rr = (price-t2)/risk if risk > 0 else np.nan
+
+    available = [k for k in ["1H","4H","Daily"] if scores[k] is not None]
+    bullish = [k for k in available if scores[k] >= 65]
+    bearish = [k for k in available if scores[k] < 40]
+
+    if len(bullish) == len(available):
+        alignment = "Bullish ausgerichtet"
+    elif len(bearish) == len(available):
+        alignment = "Bearish ausgerichtet"
+    else:
+        alignment = "Gemischte Zeitebenen"
+
+    reasons = []
+    for tf in ["Daily","4H","1H"]:
+        s = scores.get(tf)
+        if s is not None:
+            direction = "bullish" if s >= 65 else ("bearish" if s < 40 else "neutral")
+            reasons.append(f"{tf}: {direction} ({s}/100)")
 
     return {
-        "Signal": signal,
-        "Score": long_score,
-        "Preis": px,
-        "RSI": float(x["RSI"]),
-        "EMA20": float(x["EMA20"]),
-        "EMA50": float(x["EMA50"]),
-        "EMA200": float(x["EMA200"]),
-        "ATR": a,
-        "Stop": stop,
-        "Target 1": target1,
-        "Target 2": target2,
+        "signal": signal, "score": combined, "scores": scores,
+        "price": price, "atr": a, "entry_low": entry_low, "entry_high": entry_high,
+        "stop": stop, "t1": t1, "t2": t2, "t3": t3, "rr": rr,
+        "alignment": alignment, "reasons": reasons, "frames": frames
     }
 
-@st.cache_data(ttl=300)
-def load_data(ticker, period="1y", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna()
-
-st.title("Market Signal AI")
-st.caption("Technischer Multi-Asset-Scanner · nur zu Analyse- und Ausbildungszwecken")
+st.title("Market Signal AI · V3")
+st.caption("Multi-Timeframe Scanner: 1H + 4H + Daily")
 
 with st.sidebar:
-    st.header("Einstellungen")
-    selected = st.multiselect(
-        "Märkte",
-        list(ASSETS.keys()),
-        default=list(ASSETS.keys())
-    )
-    timeframe = st.selectbox("Timeframe", ["1d", "1h"], index=0)
-    period = "1y" if timeframe == "1d" else "3mo"
-    st.info("Die erste Version nutzt technische Signale. News-, Makro- und KI-Sentiment können als nächste Module ergänzt werden.")
+    st.header("Märkte")
+    selected = st.multiselect("Auswahl", list(ASSETS), default=list(ASSETS))
+    st.caption("Gewichtung: Daily 45% · 4H 35% · 1H 20%")
+    st.warning("Analyse-Prototyp – keine Anlageberatung.")
 
+results = {}
 rows = []
-details = {}
 
-for name in selected:
-    try:
-        df = load_data(ASSETS[name], period=period, interval=timeframe)
-        if len(df) < 60:
-            continue
-        df = enrich(df)
-        sig = score_signal(df)
-        rows.append({
-            "Markt": name,
-            "Signal": sig["Signal"],
-            "Score": sig["Score"],
-            "Preis": sig["Preis"],
-            "RSI": sig["RSI"],
-        })
-        details[name] = (df, sig)
-    except Exception:
-        pass
+with st.spinner("Märkte werden analysiert ..."):
+    for name in selected:
+        try:
+            r = analyze(ASSETS[name])
+            if r:
+                results[name] = r
+                rows.append({
+                    "Markt": name,
+                    "Signal": r["signal"],
+                    "Gesamt": r["score"],
+                    "Daily": r["scores"]["Daily"],
+                    "4H": r["scores"]["4H"],
+                    "1H": r["scores"]["1H"],
+                    "Preis": r["price"],
+                    "Ausrichtung": r["alignment"]
+                })
+        except Exception:
+            pass
 
 if not rows:
-    st.warning("Keine Marktdaten verfügbar. Prüfe Internetzugang und Datenquelle.")
+    st.error("Keine Daten verfügbar. Bitte später erneut versuchen.")
     st.stop()
 
-overview = pd.DataFrame(rows).sort_values("Score", ascending=False)
-st.subheader("Scanner")
+overview = pd.DataFrame(rows).sort_values("Gesamt", ascending=False)
+st.subheader("Multi-Timeframe Scanner")
 st.dataframe(
-    overview,
-    use_container_width=True,
-    hide_index=True,
+    overview, use_container_width=True, hide_index=True,
     column_config={
-        "Score": st.column_config.ProgressColumn("Long-Score", min_value=0, max_value=100),
-        "Preis": st.column_config.NumberColumn(format="%.2f"),
-        "RSI": st.column_config.NumberColumn(format="%.1f"),
+        "Gesamt": st.column_config.ProgressColumn("Gesamt", min_value=0, max_value=100),
+        "Daily": st.column_config.NumberColumn(format="%d"),
+        "4H": st.column_config.NumberColumn(format="%d"),
+        "1H": st.column_config.NumberColumn(format="%d"),
+        "Preis": st.column_config.NumberColumn(format="%.4f"),
     }
 )
 
-st.subheader("Marktdetail")
+st.subheader("Setup-Detail")
 market = st.selectbox("Markt auswählen", overview["Markt"].tolist())
-df, sig = details[market]
+r = results[market]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Signal", sig["Signal"])
-c2.metric("Long-Score", f'{sig["Score"]}/100')
-c3.metric("Preis", f'{sig["Preis"]:.2f}')
-c4.metric("RSI", f'{sig["RSI"]:.1f}')
+a,b,c,d = st.columns(4)
+a.metric("Signal", r["signal"])
+b.metric("Gesamt-Score", f'{r["score"]}/100')
+c.metric("Preis", f'{r["price"]:.4f}')
+d.metric("Ausrichtung", r["alignment"])
 
-chart_df = df[["Close", "EMA20", "EMA50", "EMA200"]].tail(220)
-st.line_chart(chart_df, use_container_width=True)
+a,b,c = st.columns(3)
+a.metric("Daily", "—" if r["scores"]["Daily"] is None else f'{r["scores"]["Daily"]}/100')
+b.metric("4H", "—" if r["scores"]["4H"] is None else f'{r["scores"]["4H"]}/100')
+c.metric("1H", "—" if r["scores"]["1H"] is None else f'{r["scores"]["1H"]}/100')
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Stop", f'{sig["Stop"]:.2f}')
-c2.metric("Target 1", f'{sig["Target 1"]:.2f}')
-c3.metric("Target 2", f'{sig["Target 2"]:.2f}')
+st.markdown("### Trade-Plan")
+a,b,c,d = st.columns(4)
+a.metric("Entry-Zone", f'{r["entry_low"]:.4f} – {r["entry_high"]:.4f}')
+b.metric("Stop", f'{r["stop"]:.4f}')
+c.metric("Target 1", f'{r["t1"]:.4f}')
+d.metric("Target 2", f'{r["t2"]:.4f}')
 
-st.markdown("### Signal-Komponenten")
-st.write({
-    "EMA20 > EMA50": bool(sig["EMA20"] > sig["EMA50"]),
-    "EMA50 > EMA200": bool(sig["EMA50"] > sig["EMA200"]),
-    "Preis > EMA200": bool(sig["Preis"] > sig["EMA200"]),
-    "RSI": round(sig["RSI"], 1),
-})
+a,b = st.columns(2)
+a.metric("Target 3", f'{r["t3"]:.4f}')
+b.metric("R/R bis Target 2", f'{r["rr"]:.2f}')
 
-st.warning(
-    "Keine Anlageberatung. Die Signale sind mechanische Auswertungen historischer Marktdaten. "
-    "Vor echtem Einsatz sollten Backtests, Slippage, Gebühren, Datenqualität und Paper Trading berücksichtigt werden."
+st.markdown("### Warum dieses Signal?")
+for reason in r["reasons"]:
+    st.write("• " + reason)
+
+chart_tf = st.radio("Chart", ["1H","4H","Daily"], horizontal=True, index=1)
+chart = r["frames"].get(chart_tf)
+if chart is not None:
+    st.line_chart(chart[["Close","EMA20","EMA50","EMA200"]].tail(220), use_container_width=True)
+
+st.info(
+    "V3 kombiniert drei Zeitebenen. Entry, Stop und Targets sind ATR-basierte Modellwerte, "
+    "keine Garantie für zukünftige Kursbewegungen. Vor Echtgeld-Einsatz: Backtest, Gebühren, "
+    "Slippage und Paper Trading berücksichtigen."
 )
