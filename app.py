@@ -304,7 +304,37 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
     }
 
 
-st.title("Market Signal AI · V4")
+
+@st.cache_data(ttl=3600)
+def historical_quality(ticker):
+    bt = backtest_daily(ticker)
+    if bt is None:
+        return {"grade":"N/A","label":"Nicht genug Daten","pf":np.nan,"dd":np.nan,"trades":0,"return_pct":np.nan}
+    pf, dd, n = bt["profit_factor"], bt["max_drawdown"], bt["count"]
+    if pf >= 1.35 and dd <= 15: grade,label="A","Gut"
+    elif pf >= 1.20 and dd <= 18: grade,label="B","Brauchbar"
+    elif pf >= 1.05 and dd <= 22: grade,label="C","Schwach"
+    else: grade,label="D","Kein belastbarer Edge"
+    if n < 80 and grade=="A": grade,label="B*","Interessant, kleine Stichprobe"
+    return {"grade":grade,"label":label,"pf":pf,"dd":dd,"trades":n,"return_pct":bt["return_pct"]}
+
+def execution_state(r, q):
+    score, sc = r["score"], r["scores"]
+    daily,h4,h1=sc.get("Daily"),sc.get("4H"),sc.get("1H")
+    if q["grade"]=="D": return "NO TRADE","Historisches Modell zeigt keinen belastbaren Edge."
+    if score >= 65:
+        if daily is None or daily < 65: return "NO TRADE","Daily bestätigt LONG noch nicht."
+        if h4 is None or h4 < 65: return "NO TRADE","4H bestätigt LONG noch nicht."
+        if h1 is not None and h1 < 50: return "NO TRADE","1H-Entry noch nicht bestätigt."
+        return r["signal"],"LONG durch Daily und 4H bestätigt."
+    if score < 40:
+        if daily is None or daily >= 40: return "NO TRADE","Daily bestätigt SHORT noch nicht."
+        if h4 is None or h4 >= 40: return "NO TRADE","4H bestätigt SHORT noch nicht."
+        if h1 is not None and h1 >= 50: return "NO TRADE","1H-Entry noch nicht bestätigt."
+        return r["signal"],"SHORT durch Daily und 4H bestätigt."
+    return "NO TRADE","Technischer Score liegt im neutralen Bereich."
+
+st.title("Market Signal AI · V5.1")
 st.caption("Multi-Timeframe Scanner: 1H + 4H + Daily")
 
 with st.sidebar:
@@ -322,15 +352,14 @@ with st.spinner("Märkte werden analysiert ..."):
             r = analyze(ASSETS[name])
             if r:
                 results[name] = r
+                q = historical_quality(ASSETS[name])
+                state, reason = execution_state(r, q)
+                r["quality"], r["execution_state"], r["execution_reason"] = q, state, reason
                 rows.append({
-                    "Markt": name,
-                    "Signal": r["signal"],
-                    "Gesamt": r["score"],
-                    "Daily": r["scores"]["Daily"],
-                    "4H": r["scores"]["4H"],
-                    "1H": r["scores"]["1H"],
-                    "Preis": r["price"],
-                    "Ausrichtung": r["alignment"]
+                    "Markt": name, "Trade-Status": state, "Technisches Signal": r["signal"],
+                    "Gesamt": r["score"], "Modell": q["grade"], "Profit Factor": q["pf"],
+                    "Max DD %": q["dd"], "Daily": r["scores"]["Daily"], "4H": r["scores"]["4H"],
+                    "1H": r["scores"]["1H"], "Preis": r["price"]
                 })
         except Exception:
             pass
@@ -349,6 +378,8 @@ st.dataframe(
         "4H": st.column_config.NumberColumn(format="%d"),
         "1H": st.column_config.NumberColumn(format="%d"),
         "Preis": st.column_config.NumberColumn(format="%.4f"),
+        "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+        "Max DD %": st.column_config.NumberColumn(format="%.1f"),
     }
 )
 
@@ -357,10 +388,21 @@ market = st.selectbox("Markt auswählen", overview["Markt"].tolist())
 r = results[market]
 
 a,b,c,d = st.columns(4)
-a.metric("Signal", r["signal"])
-b.metric("Gesamt-Score", f'{r["score"]}/100')
-c.metric("Preis", f'{r["price"]:.4f}')
-d.metric("Ausrichtung", r["alignment"])
+a.metric("Trade-Status", r["execution_state"])
+b.metric("Technischer Score", f'{r["score"]}/100')
+c.metric("Technisches Signal", r["signal"])
+d.metric("Preis", f'{r["price"]:.4f}')
+
+q=r["quality"]
+st.markdown("### Historische Modellqualität")
+qa,qb,qc,qd,qe=st.columns(5)
+qa.metric("Qualität", f'{q["grade"]} · {q["label"]}')
+qb.metric("Profit Factor", "—" if not np.isfinite(q["pf"]) else f'{q["pf"]:.2f}')
+qc.metric("Max. Drawdown", "—" if not np.isfinite(q["dd"]) else f'{q["dd"]:.1f}%')
+qd.metric("Trades", q["trades"])
+qe.metric("Backtest-Rendite", "—" if not np.isfinite(q["return_pct"]) else f'{q["return_pct"]:.1f}%')
+if r["execution_state"]=="NO TRADE": st.warning("NO TRADE: "+r["execution_reason"])
+else: st.success(r["execution_state"]+": "+r["execution_reason"])
 
 a,b,c = st.columns(3)
 a.metric("Daily", "—" if r["scores"]["Daily"] is None else f'{r["scores"]["Daily"]}/100')
