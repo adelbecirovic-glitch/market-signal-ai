@@ -3,7 +3,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Market Signal AI V3", layout="wide")
+st.set_page_config(page_title="Market Signal AI V5.2", layout="wide")
 
 ASSETS = {
     "S&P 500": "^GSPC",
@@ -182,7 +182,7 @@ def analyze(ticker):
     }
 
 
-def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
+def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01, fee_bps=5.0, slippage_bps=3.0):
     """
     Conservative daily backtest of the same technical score family.
     Long entry: score >= 65; short entry: score < 40.
@@ -206,6 +206,7 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
 
     equity = initial_capital
     peak = equity
+    equity_curve = []
     max_dd = 0.0
     trades = []
     position = None
@@ -220,7 +221,10 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
             if direction == 0:
                 continue
 
-            entry = float(nxt["Open"])
+            raw_entry = float(nxt["Open"])
+            # Adverse execution assumption: slippage worsens both entry and exit.
+            slip = slippage_bps / 10000.0
+            entry = raw_entry * (1 + slip if direction == 1 else 1 - slip)
             a = float(row["ATR"])
             if not np.isfinite(a) or a <= 0:
                 continue
@@ -264,7 +268,11 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
                 exit_price, reason = float(nxt["Open"]), "Signal"
 
         if exit_price is not None:
-            pnl = (exit_price - position["entry"]) * position["qty"] * direction
+            slip = slippage_bps / 10000.0
+            exit_price = exit_price * (1 - slip if direction == 1 else 1 + slip)
+            gross_pnl = (exit_price - position["entry"]) * position["qty"] * direction
+            fees = (abs(position["entry"] * position["qty"]) + abs(exit_price * position["qty"])) * (fee_bps / 10000.0)
+            pnl = gross_pnl - fees
             equity += pnl
             peak = max(peak, equity)
             dd = (peak - equity) / peak if peak > 0 else 0
@@ -276,10 +284,13 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
                 "Richtung": "LONG" if direction == 1 else "SHORT",
                 "Entry-Preis": position["entry"],
                 "Exit-Preis": exit_price,
+                "Brutto-PnL": gross_pnl,
+                "Gebühren": fees,
                 "PnL": pnl,
                 "Return auf Startkapital %": pnl / initial_capital * 100,
                 "Exit-Grund": reason
             })
+            equity_curve.append({"Date": df.index[i+1], "Equity": equity})
             position = None
 
     if not trades:
@@ -292,15 +303,37 @@ def backtest_daily(ticker, initial_capital=10000.0, risk_pct=0.01):
     gross_loss = abs(losses["PnL"].sum())
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
 
+    avg_win = wins["PnL"].mean() if len(wins) else 0.0
+    avg_loss = losses["PnL"].mean() if len(losses) else 0.0
+    expectancy = t["PnL"].mean()
+
+    def side_stats(side):
+        x = t[t["Richtung"] == side]
+        if x.empty:
+            return {"trades":0,"win_rate":np.nan,"pf":np.nan,"return_pct":0.0,"expectancy":np.nan}
+        w=x[x["PnL"]>0]; l=x[x["PnL"]<0]
+        gp=w["PnL"].sum(); gl=abs(l["PnL"].sum())
+        pf=gp/gl if gl>0 else np.inf
+        return {"trades":len(x),"win_rate":len(w)/len(x)*100,"pf":pf,
+                "return_pct":x["Return auf Startkapital %"].sum(),"expectancy":x["PnL"].mean()}
+
+    # Simple chronological holdout: last 30% of completed trades as out-of-sample proxy.
+    split=max(1, int(len(t)*0.70))
+    ins=t.iloc[:split]; oos=t.iloc[split:]
+    def sample_stats(x):
+        if x.empty: return {"trades":0,"return_pct":np.nan,"pf":np.nan,"win_rate":np.nan}
+        w=x[x["PnL"]>0]; l=x[x["PnL"]<0]; gl=abs(l["PnL"].sum())
+        return {"trades":len(x),"return_pct":x["Return auf Startkapital %"].sum(),
+                "pf":w["PnL"].sum()/gl if gl>0 else np.inf,"win_rate":len(w)/len(x)*100}
+
     return {
-        "trades": t,
-        "count": len(t),
-        "win_rate": len(wins) / len(t) * 100,
-        "net_profit": equity - initial_capital,
-        "return_pct": (equity / initial_capital - 1) * 100,
-        "profit_factor": profit_factor,
-        "max_drawdown": max_dd * 100,
-        "ending_equity": equity,
+        "trades": t, "count": len(t), "win_rate": len(wins) / len(t) * 100,
+        "net_profit": equity - initial_capital, "return_pct": (equity / initial_capital - 1) * 100,
+        "profit_factor": profit_factor, "max_drawdown": max_dd * 100, "ending_equity": equity,
+        "avg_win": avg_win, "avg_loss": avg_loss, "expectancy": expectancy,
+        "fees_total": t["Gebühren"].sum(), "long": side_stats("LONG"), "short": side_stats("SHORT"),
+        "in_sample": sample_stats(ins), "out_sample": sample_stats(oos),
+        "equity_curve": pd.DataFrame(equity_curve), "fee_bps": fee_bps, "slippage_bps": slippage_bps
     }
 
 
@@ -334,7 +367,7 @@ def execution_state(r, q):
         return r["signal"],"SHORT durch Daily und 4H bestätigt."
     return "NO TRADE","Technischer Score liegt im neutralen Bereich."
 
-st.title("Market Signal AI · V5.1")
+st.title("Market Signal AI · V5.2")
 st.caption("Multi-Timeframe Scanner: 1H + 4H + Daily")
 
 with st.sidebar:
@@ -430,18 +463,22 @@ if chart is not None:
     st.line_chart(chart[["Close","EMA20","EMA50","EMA200"]].tail(220), use_container_width=True)
 
 st.info(
-    "V3 kombiniert drei Zeitebenen. Entry, Stop und Targets sind ATR-basierte Modellwerte, "
+    "V5.2 kombiniert drei Zeitebenen. Entry, Stop und Targets sind ATR-basierte Modellwerte. "
     "keine Garantie für zukünftige Kursbewegungen. Vor Echtgeld-Einsatz: Backtest, Gebühren, "
-    "Slippage und Paper Trading berücksichtigen."
+    "Gebühren, Slippage und Paper Trading sind im Backtest separat prüfbar."
 )
 
 
 st.divider()
-st.header("Historischer Backtest")
+st.header("Backtest 2.0 · Kosten & Robustheit")
 st.caption(
     "Tagesdaten, bis zu 10 Jahre. Einstieg am nächsten Tages-Open nach dem Signal. "
-    "Modell: 1 % Kontorisiko je Trade, ATR-Stop 1,5×, Target 2,5×."
+    "Modell: 1 % Kontorisiko je Trade, ATR-Stop 1,5×, Target 2,5×. V5.2 berücksichtigt Gebühren und Slippage."
 )
+
+cc1,cc2 = st.columns(2)
+fee_bps = cc1.number_input("Gebühren je Ausführung (Basispunkte)", min_value=0.0, max_value=100.0, value=5.0, step=1.0)
+slippage_bps = cc2.number_input("Slippage je Ausführung (Basispunkte)", min_value=0.0, max_value=100.0, value=3.0, step=1.0)
 
 bt_market = st.selectbox("Backtest-Markt", list(ASSETS.keys()), key="bt_market")
 run_bt = st.button("Backtest starten", type="primary")
@@ -449,7 +486,7 @@ run_bt = st.button("Backtest starten", type="primary")
 if run_bt:
     with st.spinner(f"Backtest für {bt_market} läuft ..."):
         try:
-            bt = backtest_daily(ASSETS[bt_market])
+            bt = backtest_daily(ASSETS[bt_market], fee_bps=fee_bps, slippage_bps=slippage_bps)
         except Exception as e:
             bt = None
             st.error(f"Backtest konnte nicht geladen werden: {e}")
@@ -464,6 +501,38 @@ if run_bt:
         pf = bt["profit_factor"]
         c4.metric("Profit Factor", "∞" if not np.isfinite(pf) else f"{pf:.2f}")
         c5.metric("Max. Drawdown", f'{bt["max_drawdown"]:.1f}%')
+
+        st.markdown("### Edge-Diagnose")
+        e1,e2,e3,e4 = st.columns(4)
+        e1.metric("Expectancy / Trade", f'{bt["expectancy"]:.2f}')
+        e2.metric("Ø Gewinn", f'{bt["avg_win"]:.2f}')
+        e3.metric("Ø Verlust", f'{bt["avg_loss"]:.2f}')
+        e4.metric("Gebühren gesamt", f'{bt["fees_total"]:.2f}')
+
+        st.markdown("### LONG vs. SHORT")
+        side_df = pd.DataFrame([
+            {"Richtung":"LONG", **bt["long"]},
+            {"Richtung":"SHORT", **bt["short"]}
+        ]).rename(columns={"trades":"Trades","win_rate":"Trefferquote %","pf":"Profit Factor",
+                           "return_pct":"Rendite %","expectancy":"Expectancy"})
+        st.dataframe(side_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Chronologischer Robustheitscheck · 70/30")
+        io = pd.DataFrame([
+            {"Periode":"In-Sample · erste 70 %", **bt["in_sample"]},
+            {"Periode":"Out-of-Sample · letzte 30 %", **bt["out_sample"]}
+        ]).rename(columns={"trades":"Trades","return_pct":"Rendite %","pf":"Profit Factor","win_rate":"Trefferquote %"})
+        st.dataframe(io, use_container_width=True, hide_index=True)
+        if bt["out_sample"]["trades"] >= 10 and np.isfinite(bt["out_sample"]["pf"]):
+            if bt["out_sample"]["pf"] >= 1.10 and bt["out_sample"]["return_pct"] > 0:
+                st.success("OOS-Check: Edge bleibt in der jüngeren Stichprobe positiv.")
+            else:
+                st.warning("OOS-Check: Edge ist in der jüngeren Stichprobe nicht robust bestätigt.")
+
+        if not bt["equity_curve"].empty:
+            st.markdown("### Equity-Kurve")
+            eq = bt["equity_curve"].set_index("Date")[["Equity"]]
+            st.line_chart(eq, use_container_width=True)
 
         st.markdown("### Letzte Trades")
         shown = bt["trades"].tail(30).copy()
@@ -480,7 +549,7 @@ if run_bt:
         )
 
         st.warning(
-            "Backtests sind hypothetisch. Dieses Modell berücksichtigt keine Gebühren, "
-            "Slippage, Finanzierungskosten, Steuern oder reale Ausführungsprobleme. "
+            "Backtests sind hypothetisch. V5.2 modelliert Gebühren und Slippage, berücksichtigt aber keine "
+            "Finanzierungskosten, Steuern, Liquiditätsgrenzen oder sonstige reale Ausführungsprobleme. "
             "Historische Ergebnisse garantieren keine zukünftige Performance."
         )
